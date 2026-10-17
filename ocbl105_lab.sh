@@ -32,13 +32,18 @@ usage() {
 Usage: bash ocbl105_lab.sh [options]
 
   -p, --project ID      Use this project (default: auto-detect qwiklabs-gcp-*)
+      --eu-region R     Region for notus-1-mig (default: europe-west4; if the
+                        project's location policy forbids it, the script tries
+                        other regions automatically unless you pin one here)
+      --stress-zone Z   Zone for the stress-test VM (default: us-east1-b, with
+                        automatic fallback unless you pin one here)
       --stress-wait S   Seconds to watch the load test (default: 600)
       --verify-only     Create nothing; only print the checkpoint report
   -h, --help            Show this help
 
 Environment variables:
   FORCE=1               Allow a project that is not named qwiklabs-gcp-*
-  STRESS_ZONE=us-east1-b  Zone for the stress-test VM (a US zone, not us-central1)
+  EU_REGION, STRESS_ZONE   Same as --eu-region / --stress-zone
 USAGE
 }
 
@@ -48,7 +53,12 @@ HC_RANGES="130.211.0.0/22,35.191.0.0/16"
 NET_TAG="allow-health-checks"
 US_REGION="us-central1"
 US_ZONE="us-central1-c"
-EU_REGION="europe-west4"
+# Second backend region: the lab says europe-west4, but some lab projects carry an
+# org policy (constraints/gcp.resourceLocations) that forbids it. In that case the
+# script falls back to another allowed region unless one was pinned explicitly.
+EU_REGION_PINNED=0
+[ -n "${EU_REGION:-}" ] && EU_REGION_PINNED=1
+EU_REGION="${EU_REGION:-europe-west4}"
 ROUTER="nat-router-us1"
 NAT="nat-config"
 WEB_VM="webserver"
@@ -63,6 +73,8 @@ PROXY="http-lb-target-proxy"
 FR4="http-lb-forwarding-rule"
 FR6="http-lb-forwarding-rule-2"
 STRESS_VM="stress-test"
+STRESS_ZONE_PINNED=0
+[ -n "${STRESS_ZONE:-}" ] && STRESS_ZONE_PINNED=1
 STRESS_ZONE="${STRESS_ZONE:-us-east1-b}"
 STRESS_WAIT="${STRESS_WAIT:-600}"
 
@@ -94,6 +106,8 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 while [ $# -gt 0 ]; do
   case "$1" in
     -p|--project)   [ $# -ge 2 ] || die "--project needs a value"; PROJECT_ID="$2"; shift 2 ;;
+    --eu-region)    [ $# -ge 2 ] || die "--eu-region needs a value"; EU_REGION="$2"; EU_REGION_PINNED=1; shift 2 ;;
+    --stress-zone)  [ $# -ge 2 ] || die "--stress-zone needs a value"; STRESS_ZONE="$2"; STRESS_ZONE_PINNED=1; shift 2 ;;
     --stress-wait)  [ $# -ge 2 ] || die "--stress-wait needs a value"; STRESS_WAIT="$2"; shift 2 ;;
     --verify-only)  VERIFY_ONLY=1; shift ;;
     -h|--help)      usage; exit 0 ;;
@@ -309,10 +323,51 @@ task3_image() {
 # ============================================================================
 #  TASK 4 - instance template, health check, managed instance groups
 # ============================================================================
-autoscaler_info() {   # prints "<min> <max>" for the autoscaler that targets MIG $1
-  gcloud compute autoscalers list \
-    --format='csv[no-heading](target,autoscalingPolicy.minNumReplicas,autoscalingPolicy.maxNumReplicas)' 2>/dev/null \
-    | awk -F, -v m="/instanceGroupManagers/$1" '$1 ~ (m "$") {print $2, $3}'
+# Autoscalers created by gcloud get a random suffix (e.g. us-1-mig-eo0i), so they are
+# looked up by target MIG, not by name. Prints "<min> <max>" or nothing.
+_as_describe() {   # _as_describe <autoscaler-name> <region>
+  gcloud compute autoscalers describe "$1" --region="$2" \
+    --format='value(autoscalingPolicy.minNumReplicas,autoscalingPolicy.maxNumReplicas)' 2>/dev/null \
+    | tr '\t' ' '
+}
+
+autoscaler_info() {   # autoscaler_info <mig> <region>
+  local url name out
+  # 1) the MIG itself reports the autoscaler that targets it
+  url="$(gcloud compute instance-groups managed describe "$1" --region="$2" \
+          --format='value(status.autoscaler)' 2>/dev/null)"
+  if [ -n "$url" ]; then
+    out="$(_as_describe "${url##*/}" "$2")"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  fi
+  # 2) fall back to an autoscaler whose name starts with the MIG name
+  name="$(gcloud compute autoscalers list --format='value(name)' 2>/dev/null \
+          | awk -v m="$1" 'index($0, m) == 1 {print; exit}')"
+  if [ -n "$name" ]; then
+    out="$(_as_describe "$name" "$2")"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  fi
+  return 0
+}
+
+configure_mig() {   # configure_mig <name> <region>   (named port + autoscaler; idempotent)
+  local mig="$1" region="$2"
+
+  # Named port used by the backend service (port name "http" -> 80)
+  must gcloud compute instance-groups managed set-named-ports "$mig" \
+    --named-ports=http:80 --region="$region"
+
+  if [ -z "$(autoscaler_info "$mig" "$region")" ]; then
+    # If an autoscaler already exists this simply updates it with the same values.
+    must gcloud compute instance-groups managed set-autoscaling "$mig" \
+      --region="$region" \
+      --min-num-replicas=1 \
+      --max-num-replicas=2 \
+      --target-load-balancing-utilization=0.8 \
+      --cool-down-period=60
+  else
+    log "Autoscaler for $mig already exists - skipping"
+  fi
 }
 
 create_mig() {   # create_mig <name> <region>
@@ -327,21 +382,82 @@ create_mig() {   # create_mig <name> <region>
       --health-check="$HEALTH_CHECK" \
       --initial-delay=60
   fi
+  configure_mig "$mig" "$region"
+}
 
-  # Named port used by the backend service (port name "http" -> 80)
-  must gcloud compute instance-groups managed set-named-ports "$mig" \
-    --named-ports=http:80 --region="$region"
-
-  if [ -z "$(autoscaler_info "$mig")" ]; then
-    must gcloud compute instance-groups managed set-autoscaling "$mig" \
-      --region="$region" \
-      --min-num-replicas=1 \
-      --max-num-replicas=2 \
-      --target-load-balancing-utilization=0.8 \
-      --cool-down-period=60
-  else
-    log "Autoscaler for $mig already exists - skipping"
+# ---- location-policy handling (constraints/gcp.resourceLocations) -------------
+POLICY_SHOWN=0
+show_location_policy() {   # read-only, best effort, printed once
+  [ "$POLICY_SHOWN" = 1 ] && return 0
+  POLICY_SHOWN=1
+  local pol
+  pol="$(gcloud org-policies describe gcp.resourceLocations --project="$PROJECT_ID" --effective 2>/dev/null)" \
+    || pol="$(gcloud resource-manager org-policies describe gcp.resourceLocations --project="$PROJECT_ID" --effective 2>/dev/null)" \
+    || pol=""
+  if [ -n "$pol" ]; then
+    log "Effective location policy of this project (allowed locations):"
+    printf '%s\n' "$pol" | head -n 25
   fi
+}
+
+eu_region_candidates() {
+  if [ "$EU_REGION_PINNED" = 1 ]; then echo "$EU_REGION"; return 0; fi
+  echo "$EU_REGION europe-west1 europe-west2 europe-west3 europe-north1 asia-east1 asia-southeast1 us-east1 us-west1"
+}
+
+stress_zone_candidates() {
+  if [ "$STRESS_ZONE_PINNED" = 1 ]; then echo "$STRESS_ZONE"; return 0; fi
+  echo "$STRESS_ZONE us-east4-b us-west1-b us-west2-b us-east1-c us-central1-a"
+}
+
+detect_existing_locations() {   # re-runs / --verify-only: reuse where things were created
+  local r z
+  r="$(gcloud compute instance-groups managed list --filter="name=$EU_MIG" --format='value(region.basename())' 2>/dev/null | head -n1)"
+  if [ -n "$r" ]; then EU_REGION="$r"; fi
+  z="$(gcloud compute instances list --filter="name=$STRESS_VM" --format='value(zone.basename())' 2>/dev/null | head -n1)"
+  if [ -n "$z" ]; then STRESS_ZONE="$z"; fi
+  return 0
+}
+
+# Creates notus-1-mig in europe-west4, or - if the project's location policy forbids
+# that region - in the first other candidate region the policy accepts.
+create_eu_mig() {
+  local cand out rc found
+  found="$(gcloud compute instance-groups managed list --filter="name=$EU_MIG" --format='value(region.basename())' 2>/dev/null | head -n1)"
+  if [ -n "$found" ]; then
+    EU_REGION="$found"
+    log "$EU_MIG already exists in $EU_REGION - skipping create"
+    configure_mig "$EU_MIG" "$EU_REGION"
+    return 0
+  fi
+
+  for cand in $(eu_region_candidates); do
+    log "Creating $EU_MIG in $cand ..."
+    out="$(gcloud compute instance-groups managed create "$EU_MIG" \
+            --template="$TEMPLATE" \
+            --size=1 \
+            --region="$cand" \
+            --health-check="$HEALTH_CHECK" \
+            --initial-delay=60 2>&1)"
+    rc=$?
+    printf '%s\n' "$out"
+    if [ "$rc" -eq 0 ]; then
+      EU_REGION="$cand"
+      if [ "$cand" != "europe-west4" ]; then
+        warn "The lab text asks for europe-west4, but this project's location policy does not allow it."
+        warn "$EU_MIG was created in $cand instead (the closest allowed region found)."
+      fi
+      configure_mig "$EU_MIG" "$EU_REGION"
+      return 0
+    fi
+    if [[ "$out" == *"resourceLocations"* ]]; then
+      warn "Region $cand is not allowed by this project's location policy."
+      show_location_policy
+      continue
+    fi
+    die "Creating $EU_MIG in $cand failed for a reason other than the location policy (see message above)."
+  done
+  die "None of the candidate regions is allowed by this project's location policy. Look at the policy printed above (or the lab panel) and re-run with: --eu-region <allowed-region>"
 }
 
 wait_mig_stable() {   # wait_mig_stable <name> <region>
@@ -372,7 +488,7 @@ task4_template_and_migs() {
   fi
 
   create_mig "$US_MIG" "$US_REGION"
-  create_mig "$EU_MIG" "$EU_REGION"
+  create_eu_mig
 
   wait_mig_stable "$US_MIG" "$US_REGION"
   wait_mig_stable "$EU_MIG" "$EU_REGION"
@@ -515,6 +631,32 @@ setsid nohup /usr/local/bin/lab-stress.sh > /var/log/lab-stress.log 2>&1 < /dev/
 EOF
 }
 
+create_stress_vm() {   # create_stress_vm <startup-script-file>
+  local script="$1" cand out rc
+  for cand in $(stress_zone_candidates); do
+    log "Creating $STRESS_VM in $cand (runs: ab -n 500000 -c 1000 http://$LB_IP_V4/)"
+    out="$(gcloud compute instances create "$STRESS_VM" \
+            --zone="$cand" \
+            --machine-type=e2-micro \
+            --image="$IMAGE" \
+            --image-project="$PROJECT_ID" \
+            --metadata-from-file=startup-script="$script" 2>&1)"
+    rc=$?
+    printf '%s\n' "$out"
+    if [ "$rc" -eq 0 ]; then
+      STRESS_ZONE="$cand"
+      return 0
+    fi
+    if [[ "$out" == *"resourceLocations"* ]]; then
+      warn "Zone $cand is not allowed by this project's location policy."
+      show_location_policy
+      continue
+    fi
+    die "Creating $STRESS_VM in $cand failed for a reason other than the location policy (see message above)."
+  done
+  die "None of the candidate zones is allowed by the location policy. Re-run with: --stress-zone <allowed-zone>"
+}
+
 mig_size() {   # mig_size <name> <region>
   gcloud compute instance-groups managed describe "$1" --region="$2" --format='value(targetSize)' 2>/dev/null
 }
@@ -528,13 +670,7 @@ task6_stress() {
     log "VM $STRESS_VM already exists - skipping create (its load generator started at boot)"
   else
     write_stress_startup_script "$TMP_DIR/stress-startup.sh" "$LB_IP_V4"
-    log "Creating $STRESS_VM in $STRESS_ZONE (runs: ab -n 500000 -c 1000 http://$LB_IP_V4/)"
-    must gcloud compute instances create "$STRESS_VM" \
-      --zone="$STRESS_ZONE" \
-      --machine-type=e2-micro \
-      --image="$IMAGE" \
-      --image-project="$PROJECT_ID" \
-      --metadata-from-file=startup-script="$TMP_DIR/stress-startup.sh"
+    create_stress_vm "$TMP_DIR/stress-startup.sh"
   fi
 
   log "Watching the load for up to ${STRESS_WAIT}s (autoscaling + traffic spill-over to $EU_MIG)..."
@@ -578,8 +714,8 @@ v_task4() {
   exists gcloud compute health-checks describe "$HEALTH_CHECK" || return 1
   exists gcloud compute instance-groups managed describe "$US_MIG" --region="$US_REGION" || return 1
   exists gcloud compute instance-groups managed describe "$EU_MIG" --region="$EU_REGION" || return 1
-  a_us="$(autoscaler_info "$US_MIG")"
-  a_eu="$(autoscaler_info "$EU_MIG")"
+  a_us="$(autoscaler_info "$US_MIG" "$US_REGION")"
+  a_eu="$(autoscaler_info "$EU_MIG" "$EU_REGION")"
   [ "$a_us" = "1 2" ] && [ "$a_eu" = "1 2" ]
 }
 
@@ -620,6 +756,7 @@ report() {
   check 20 "Configure the Application Load Balancer (HTTP)"            v_task5
   check 20 "Stress test the Application Load Balancer (HTTP)"          v_task6
   printf '\n  SCORE: %d / %d\n' "$SCORE" "$TOTAL"
+  printf '  Regions used: %s=%s  %s=%s  %s zone=%s\n' "$US_MIG" "$US_REGION" "$EU_MIG" "$EU_REGION" "$STRESS_VM" "$STRESS_ZONE"
   [ -n "$LB_IP_V4" ] && printf '  Load balancer: http://%s/   (IPv6: %s)\n' "$LB_IP_V4" "${LB_IP_V6:-n/a}"
   if [ "$SCORE" -eq "$TOTAL" ]; then
     printf '\n  All resources are in place. Now click "Check my progress" on each task in the lab page.\n'
@@ -632,6 +769,7 @@ report() {
 # --------------------------------- main --------------------------------------
 main() {
   preflight
+  detect_existing_locations
 
   if [ "$VERIFY_ONLY" = 1 ]; then
     read_lb_ips
